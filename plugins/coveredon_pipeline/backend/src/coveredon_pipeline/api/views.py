@@ -90,7 +90,7 @@ def _get_admin_credentials():
     return email, password
 
 
-def _get_jwt():
+def _get_jwt(request=None):
     """Obtain a Baserow admin JWT via the token-auth endpoint.
 
     Raises RuntimeError if credentials are missing or authentication
@@ -218,7 +218,7 @@ class PingView(APIView):
 
     def get(self, request):
         try:
-            token = _get_jwt()
+            token = _get_jwt(request)
         except RuntimeError as exc:
             return Response(
                 {"plugin": "coveredon_pipeline", "status": "degraded", "error": str(exc)},
@@ -250,7 +250,7 @@ class TriageView(APIView):
 
     def get(self, request):
         try:
-            token = _get_jwt()
+            token = _get_jwt(request)
             leads = _fetch_leads(token)
         except RuntimeError as exc:
             return Response(
@@ -333,7 +333,7 @@ class StatsView(APIView):
 
     def get(self, request):
         try:
-            token = _get_jwt()
+            token = _get_jwt(request)
             leads = _fetch_leads(token)
         except RuntimeError as exc:
             return Response(
