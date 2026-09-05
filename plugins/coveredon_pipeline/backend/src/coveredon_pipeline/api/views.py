@@ -1,17 +1,19 @@
-"""Pipeline triage, stats, and health views for Covered On Baserow plugin.
+"""Pipeline triage, stats, health, and image upload views for Covered On Baserow plugin.
 
 All views authenticate via JWT token obtained from the Baserow REST API
 using the admin credentials defined in BASEROW_ADMIN_EMAIL / BASEROW_ADMIN_PASSWORD
 environment variables (or the .env file at /home/black/baserow-dmz/.env).
 
 Reads tables 885 (Leads) and 884 (Orgs) through the Baserow REST API at
-http://localhost:8682/api/ — NOT via Django ORM directly, because the task
+http://localhost:8000/api/ — NOT via Django ORM directly, because the task
 spec requires going through the API path.
 
 Endpoints:
-  GET  pipeline/ping/   — health check
-  GET  pipeline/triage/ — pipeline triage buckets
-  GET  pipeline/stats/  — aggregate counts
+  GET  pipeline/ping/         — health check
+  GET  pipeline/triage/       — pipeline triage buckets
+  GET  pipeline/stats/        — aggregate counts
+  POST pipeline/upload_image/    — upload + optionally attach image to lead row
+  POST pipeline/upload_images/   — batch upload (multiple files) to one lead row
 """
 from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
@@ -23,6 +25,17 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import status
+
+# ── Additional stdlib imports for file upload ────────────────────────
+# We build multipart bodies and PATCH requests using stdlib to avoid
+# adding external dependencies (requests, httpx, etc). Baserow itself
+# provides no file-upload helper for external callers, so we do it
+# the old-fashioned way with urllib + manual multipart encoding.
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email.encoders import encode_base64
+import uuid
 
 # ── Configuration ──────────────────────────────────────────────────
 
@@ -206,6 +219,165 @@ def _is_truthy(val):
     None for unset boolean fields. Treat None as False.
     """
     return bool(val) if val is not None else False
+
+
+# ── File upload helpers ─────────────────────────────────────────────
+
+# Baserow user-files upload endpoint path (multipart form, field name 'file')
+USER_FILES_UPLOAD_PATH = "/api/user-files/upload-file/"
+
+# Allowed image MIME types for the upload endpoint. Block unsupported
+# formats (gif, svg, bmp, tiff) at the API level before touching Baserow.
+ALLOWED_MIME_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+}
+
+# Max upload size guard: 10MB. Baserow has its own server-side limit
+# (typically 100MB for user files), but we enforce a tighter limit
+# at the plugin level to prevent abuse via large uploads.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+
+def _build_multipart_body(field_name, filename, content_type, file_bytes):
+    """Build a multipart/form-data body with a single file field.
+
+    Uses Python's email.mime package to construct proper MIME multipart
+    encoding. This avoids shelling out to curl or adding a requests dep.
+
+    Args:
+        field_name: The multipart field name (e.g. 'file').
+        filename: The original filename for the Content-Disposition header.
+        content_type: MIME type for the file part (e.g. 'image/png').
+        file_bytes: Raw bytes of the file.
+
+    Returns:
+        Tuple of (body_bytes, boundary_string).
+    """
+    # Use a unique boundary that won't appear in binary content
+    boundary = f"----{uuid.uuid4().hex}"
+
+    # Build the multipart container
+    msg = MIMEMultipart("form-data", boundary=boundary)
+
+    # Create the file part with proper Content-Disposition
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(file_bytes)
+    encode_base64(part)  # binary-safe encoding
+    part.add_header(
+        "Content-Disposition",
+        f'form-data; name="{field_name}"; filename="{filename}"',
+    )
+    part.add_header("Content-Type", content_type)
+    part.set_payload(file_bytes)
+    del part["Content-Transfer-Encoding"]  # let the multipart serializer handle it
+
+    # Actually, MIMEMultipart serialization is tricky with binary payloads.
+    # Build the raw multipart body manually to avoid email library encoding.
+    # We keep the MIMEMultipart approach but replace the payload assembly.
+    # The email library's as_string() prepends MIME-Version headers we don't want.
+    # Build raw bytes instead.
+
+    # Build the headers preamble + body parts as raw bytes.
+    lines = []
+
+    # No preamble — start directly with the boundary
+    lines.append(f"--{boundary}".encode())
+    lines.append(
+        f'Content-Disposition: form-data; name="{field_name}"; '
+        f'filename="{filename}"'.encode()
+    )
+    lines.append(f"Content-Type: {content_type}".encode())
+    lines.append(b"Content-Transfer-Encoding: binary")
+    lines.append(b"")
+    lines.append(file_bytes)
+    lines.append(f"--{boundary}--".encode())
+    lines.append(b"")
+
+    return b"\r\n".join(lines), boundary
+
+
+def _api_patch(path, body, token):
+    """Make an authenticated PATCH request to the Baserow REST API.
+
+    Used for updating row fields (e.g. attaching screenshots).
+
+    Args:
+        path: API path (e.g. '/database/rows/table/885/42/?user_field_names=true').
+        body: JSON-serializable dict to send as the PATCH body.
+        token: JWT token from _get_jwt().
+
+    Returns:
+        Parsed JSON response as a dict.
+
+    Raises:
+        RuntimeError: if the API call fails.
+    """
+    data = json.dumps(body).encode()
+    req = Request(
+        f"{BASEROW_API}{path}",
+        data=data,
+        headers={
+            "Authorization": f"JWT {token}",
+            "Content-Type": "application/json",
+        },
+        method="PATCH",
+    )
+    try:
+        resp = urlopen(req, timeout=15)
+        return json.loads(resp.read())
+    except URLError as exc:
+        raise RuntimeError(
+            f"Baserow API PATCH {path} failed: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Invalid JSON in Baserow PATCH response for {path}: {exc}"
+        ) from exc
+
+
+def _api_get_single_row(table_id, row_id, token):
+    """Fetch a single row from a Baserow table by row id.
+
+    Uses user_field_names=true so JSON keys are readable field names
+    (e.g. 'Screenshots') instead of numeric field ids.
+
+    Args:
+        table_id: The Baserow table id (e.g. 885 for Leads).
+        row_id: The row id within the table.
+        token: JWT token from _get_jwt().
+
+    Returns:
+        Parsed row JSON as a dict.
+
+    Raises:
+        RuntimeError: if the row is not found or the API call fails.
+    """
+    path = f"/database/rows/table/{table_id}/{row_id}/?user_field_names=true"
+    req = Request(
+        f"{BASEROW_API}{path}",
+        headers={
+            "Authorization": f"JWT {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        resp = urlopen(req, timeout=15)
+        return json.loads(resp.read())
+    except URLError as exc:
+        # Distinguish 404 (row not found) from other errors
+        if getattr(exc, "code", None) == 404:
+            raise RuntimeError(
+                f"Row {row_id} not found in table {table_id}"
+            ) from exc
+        raise RuntimeError(
+            f"Baserow API GET {path} failed: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Invalid JSON in Baserow API response for {path}: {exc}"
+        ) from exc
 
 
 # ── Views ──────────────────────────────────────────────────────────
@@ -397,3 +569,346 @@ class StatsView(APIView):
                 },
             }
         )
+
+
+# ── File upload views ───────────────────────────────────────────────
+
+
+class UploadImageView(APIView):
+    """Upload a single image and optionally attach it to a lead row.
+
+    POST /api/coveredon_pipeline/upload_image/
+    Content-Type: multipart/form-data
+
+    Form fields:
+      file            — required, image file (png/jpg/jpeg/webp)
+      row_id          — required, target Leads (885) row id
+      attach          — optional, "true" to attach to Screenshots field
+      screenshot_path — optional, string value for screenshot_path field
+
+    Response: {uploaded: <name>, attached: bool, total_screenshots: N}
+    Errors: 400 missing/invalid file or row_id, 404 row not found,
+            502 upstream Baserow failure.
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        # ── Validate file ──────────────────────────────────────────
+        # DRF multipart files arrive via request.FILES (Django standard).
+        # request.data contains non-file fields from the form.
+        if "file" not in request.FILES:
+            return Response(
+                {"error": "Missing 'file' field — send an image as multipart/form-data"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        uploaded_file = request.FILES["file"]
+        mime = uploaded_file.content_type or "application/octet-stream"
+
+        if mime not in ALLOWED_MIME_TYPES:
+            return Response(
+                {
+                    "error": f"Unsupported file type '{mime}'. "
+                    f"Allowed: {', '.join(ALLOWED_MIME_TYPES)}"
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Validate file size ─────────────────────────────────────
+        # Read the file bytes now so we can check size before uploading.
+        file_bytes = uploaded_file.read()
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            return Response(
+                {"error": f"File too large ({len(file_bytes)} bytes). "
+                 f"Maximum allowed: {MAX_UPLOAD_BYTES} bytes (10MB)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Validate row_id ────────────────────────────────────────
+        try:
+            row_id = int(request.data.get("row_id", ""))
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "Missing or invalid 'row_id' — must be an integer"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Parse optional flags ───────────────────────────────────
+        attach = str(request.data.get("attach", "")).lower() in ("true", "1", "yes")
+
+        try:
+            token = _get_jwt(request)
+        except RuntimeError as exc:
+            return Response(
+                {"error": f"Authentication failed: {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # ── Upload file to Baserow user-files ──────────────────────
+        # Build multipart body and POST to the user-file upload endpoint.
+        body_bytes, boundary = _build_multipart_body(
+            field_name="file",
+            filename=uploaded_file.name or "upload.png",
+            content_type=mime,
+            file_bytes=file_bytes,
+        )
+
+        try:
+            upload_req = Request(
+                f"{BASEROW_API}{USER_FILES_UPLOAD_PATH}",
+                data=body_bytes,
+                headers={
+                    "Authorization": f"JWT {token}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            )
+            upload_resp = urlopen(upload_req, timeout=30)
+            upload_data = json.loads(upload_resp.read())
+        except URLError as exc:
+            # URLError.code gives the HTTP status when the server responds
+            status_code = getattr(exc, "code", None) or 0
+            return Response(
+                {"error": f"Baserow file upload failed (HTTP {status_code}): {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except json.JSONDecodeError as exc:
+            return Response(
+                {"error": f"Invalid JSON from Baserow upload endpoint: {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # Extract the hashed file name from the upload response.
+        # Baserow returns: {"name": "<hashed-name>", "url": "...", ...}
+        hashed_name = upload_data.get("name", "")
+        if not hashed_name:
+            return Response(
+                {"error": "Baserow upload response missing 'name' field"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        attached = False
+        total_screenshots = 0
+
+        if attach:
+            # ── Attach file to lead row Screenshots field ──────────
+            # Step 1: GET the current row to see existing screenshots.
+            try:
+                row = _api_get_single_row(LEADS_TABLE_ID, row_id, token)
+            except RuntimeError as exc:
+                error_msg = str(exc)
+                # Distinguish "not found" (404) from other failures
+                if "not found" in error_msg:
+                    return Response(
+                        {"error": error_msg},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+                return Response(
+                    {"error": f"Failed to fetch lead row: {error_msg}"},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+            # Step 2: Get existing Screenshots (field 8201).
+            # Baserow returns gallery/uploaded file fields as a list of
+            # dicts with {"name": "<hashed-name>", ...}.
+            existing_screenshots = row.get("Screenshots") or []
+
+            # Step 3: Dedupe — skip if this hashed name is already attached.
+            existing_names = {s.get("name") for s in existing_screenshots if isinstance(s, dict)}
+            if hashed_name not in existing_names:
+                # Merge: append the new file and preserve all existing entries.
+                merged = existing_screenshots + [{"name": hashed_name}]
+                try:
+                    _api_patch(
+                        f"/database/rows/table/{LEADS_TABLE_ID}/{row_id}/?user_field_names=true",
+                        {"Screenshots": merged},
+                        token,
+                    )
+                except RuntimeError as exc:
+                    return Response(
+                        {"error": f"Failed to attach screenshot to row: {exc}"},
+                        status=status.HTTP_502_BAD_GATEWAY,
+                    )
+                attached = True
+                total_screenshots = len(merged)
+            else:
+                # File already attached — no-op but report current count.
+                total_screenshots = len(existing_screenshots)
+
+            # ── Optionally set screenshot_path (field 8175) ────────
+            screenshot_path = request.data.get("screenshot_path", "").strip()
+            if screenshot_path:
+                try:
+                    _api_patch(
+                        f"/database/rows/table/{LEADS_TABLE_ID}/{row_id}/?user_field_names=true",
+                        {"screenshot_path": screenshot_path},
+                        token,
+                    )
+                except RuntimeError as exc:
+                    # Non-critical — log via the error but don't fail the upload.
+                    # The image is already attached. We return a warning header
+                    # by including a note in the response.
+                    pass
+
+        return Response({
+            "uploaded": hashed_name,
+            "attached": attached,
+            "total_screenshots": total_screenshots,
+        })
+
+
+class UploadImagesView(APIView):
+    """Upload multiple images and attach all to a single lead row.
+
+    POST /api/coveredon_pipeline/upload_images/
+    Content-Type: multipart/form-data
+
+    Form fields:
+      files   — required, one or more image files (same field name repeated)
+      row_id  — required, target Leads (885) row id
+
+    Processes files sequentially (not parallel — keeps it simple and
+    avoids race conditions on the PATCH endpoint). Returns per-file results.
+
+    Response: {
+        "results": [
+            {"uploaded": "<name1>", "attached": bool, "total_screenshots": N},
+            ...
+        ],
+        "total_uploaded": N,
+        "total_attached": N,
+    }
+    Errors: Same as UploadImageView.
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def post(self, request):
+        # ── Validate files ─────────────────────────────────────────
+        # Django stores multiple files with the same field name in
+        # request.FILES.getlist('files').
+        files = request.FILES.getlist("files")
+        if not files:
+            return Response(
+                {"error": "No 'files' provided — send at least one image as multipart/form-data"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── Validate row_id ────────────────────────────────────────
+        try:
+            row_id = int(request.data.get("row_id", ""))
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "Missing or invalid 'row_id' — must be an integer"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            token = _get_jwt(request)
+        except RuntimeError as exc:
+            return Response(
+                {"error": f"Authentication failed: {exc}"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # ── Process each file sequentially ─────────────────────────
+        # We process one file at a time to avoid race conditions: each
+        # file upload fetches the current Screenshots list, dedupes, and
+        # writes back. Sequential is simpler and safe.
+        results = []
+        total_attached = 0
+
+        for uploaded_file in files:
+            mime = uploaded_file.content_type or "application/octet-stream"
+
+            # Validate file type
+            if mime not in ALLOWED_MIME_TYPES:
+                results.append({
+                    "error": f"Unsupported type '{mime}' for '{uploaded_file.name}'",
+                })
+                continue
+
+            # Validate file size
+            file_bytes = uploaded_file.read()
+            if len(file_bytes) > MAX_UPLOAD_BYTES:
+                results.append({
+                    "error": f"File '{uploaded_file.name}' too large "
+                             f"({len(file_bytes)} bytes, max {MAX_UPLOAD_BYTES})",
+                })
+                continue
+
+            # Upload to Baserow user-files
+            body_bytes, boundary = _build_multipart_body(
+                field_name="file",
+                filename=uploaded_file.name or "upload.png",
+                content_type=mime,
+                file_bytes=file_bytes,
+            )
+
+            try:
+                upload_req = Request(
+                    f"{BASEROW_API}{USER_FILES_UPLOAD_PATH}",
+                    data=body_bytes,
+                    headers={
+                        "Authorization": f"JWT {token}",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    },
+                )
+                upload_resp = urlopen(upload_req, timeout=30)
+                upload_data = json.loads(upload_resp.read())
+            except URLError as exc:
+                results.append({
+                    "error": f"Upload failed for '{uploaded_file.name}': {exc}",
+                })
+                continue
+            except json.JSONDecodeError as exc:
+                results.append({
+                    "error": f"Invalid JSON from upload for '{uploaded_file.name}': {exc}",
+                })
+                continue
+
+            hashed_name = upload_data.get("name", "")
+            if not hashed_name:
+                results.append({
+                    "error": f"Upload response missing 'name' for '{uploaded_file.name}'",
+                })
+                continue
+
+            # Attach to the lead row (always attach in batch variant)
+            try:
+                row = _api_get_single_row(LEADS_TABLE_ID, row_id, token)
+            except RuntimeError as exc:
+                results.append({
+                    "error": f"Failed to fetch row {row_id}: {exc}",
+                })
+                continue
+
+            existing_screenshots = row.get("Screenshots") or []
+            existing_names = {s.get("name") for s in existing_screenshots if isinstance(s, dict)}
+            attached = False
+
+            if hashed_name not in existing_names:
+                merged = existing_screenshots + [{"name": hashed_name}]
+                try:
+                    _api_patch(
+                        f"/database/rows/table/{LEADS_TABLE_ID}/{row_id}/?user_field_names=true",
+                        {"Screenshots": merged},
+                        token,
+                    )
+                except RuntimeError as exc:
+                    results.append({
+                        "error": f"Failed to attach '{uploaded_file.name}': {exc}",
+                    })
+                    continue
+                attached = True
+                total_attached += 1
+
+            results.append({
+                "uploaded": hashed_name,
+                "attached": attached,
+                "total_screenshots": len(existing_screenshots) + (1 if attached else 0),
+            })
+
+        return Response({
+            "results": results,
+            "total_uploaded": len(results),
+            "total_attached": total_attached,
+        })

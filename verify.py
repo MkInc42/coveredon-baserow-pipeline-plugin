@@ -73,8 +73,8 @@ def check_content_signatures():
         "setup.py": ["find_packages", "package_dir", "src", "coveredon"],
         "apps.py": ["AppConfig", "plugin_registry", "CoveredonPipelineConfig"],
         "plugins.py": ["Plugin", "get_api_urls", "CoveredonPipelinePlugin"],
-        "urls.py": ["PingView", "TriageView", "StatsView", "app_name"],
-        "views.py": ["APIView", "IsAuthenticated", "PingView", "TriageView", "StatsView"],
+        "urls.py": ["PingView", "TriageView", "StatsView", "UploadImageView", "UploadImagesView", "app_name"],
+        "views.py": ["APIView", "IsAuthenticated", "PingView", "TriageView", "StatsView", "UploadImageView", "UploadImagesView"],
     }
 
     for fname, patterns in checks.items():
@@ -106,7 +106,7 @@ def check_view_endpoints():
     with open(path) as f:
         content = f.read()
 
-    classes_expected = ["PingView", "TriageView", "StatsView"]
+    classes_expected = ["PingView", "TriageView", "StatsView", "UploadImageView", "UploadImagesView"]
     errors = []
     for cls in classes_expected:
         if f"class {cls}" not in content:
@@ -125,7 +125,7 @@ def check_urls_endpoints():
     with open(path) as f:
         content = f.read()
 
-    routes_expected = ["ping/$", "triage/$", "stats/$"]
+    routes_expected = ["ping/$", "triage/$", "stats/$", "upload_image/$", "upload_images/$"]
     errors = []
     for route in routes_expected:
         if route not in content:

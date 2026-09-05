@@ -34,6 +34,8 @@ All endpoints require JWT authentication (DRF `IsAuthenticated`).
 | GET | `/api/coveredon_pipeline/ping/` | Health check |
 | GET | `/api/coveredon_pipeline/triage/` | Pipeline triage buckets |
 | GET | `/api/coveredon_pipeline/stats/` | Aggregate statistics |
+| POST | `/api/coveredon_pipeline/upload_image/` | Upload image + optionally attach to lead Screenshots |
+| POST | `/api/coveredon_pipeline/upload_images/` | Batch upload multiple images to a lead row |
 
 ### `GET /api/coveredon_pipeline/triage/`
 
@@ -49,6 +51,35 @@ Each bucket returns `row_id`, `org_name`, `stage`, `score`, `channel`, `updated_
 ### `GET /api/coveredon_pipeline/stats/`
 
 Returns counts grouped by `stage`, `score`, `contact_channel`, plus totals.
+
+### `POST /api/coveredon_pipeline/upload_image/`
+
+Upload a single image and optionally attach to a lead row's Screenshots gallery (field 8201).
+
+**Request:** `multipart/form-data`
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file` | file | Yes | Image (png/jpg/jpeg/webp, max 10MB) |
+| `row_id` | int | Yes | Leads (885) row id |
+| `attach` | string | No | `"true"` to attach to Screenshots gallery |
+| `screenshot_path` | string | No | Value for screenshot_path field 8175 |
+
+**Response:** `{"uploaded": "<hashed-name>", "attached": bool, "total_screenshots": N}`
+
+**Idempotent:** When `attach=true`, reads the row's current Screenshots, deduplicates by hashed name, appends only if the name is new. A re-POST of the same file returns `attached: false`.
+
+**Errors:** 400 (invalid file/row_id), 404 (row not found), 502 (Baserow upstream failure).
+
+### `POST /api/coveredon_pipeline/upload_images/`
+
+Batch upload multiple images (same `files` field name repeated) to one lead row. Always attaches — no `attach` toggle.
+
+**Request:** `multipart/form-data` with `files[]` + `row_id`.
+
+**Response:** `{"results": [...], "total_uploaded": N, "total_attached": N}`
+
+Each result entry mirrors the single-upload response. Files process sequentially to avoid race conditions.
 
 ## Auth
 
@@ -71,7 +102,7 @@ plugins/
                 └── api/
                     ├── __init__.py
                     ├── urls.py
-                    └── views.py       # PingView, TriageView, StatsView
+                    └── views.py       # PingView, TriageView, StatsView, UploadImageView, UploadImagesView
 ```
 
 ## Verification
