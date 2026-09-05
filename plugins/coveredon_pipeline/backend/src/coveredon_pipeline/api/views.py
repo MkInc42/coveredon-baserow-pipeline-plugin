@@ -29,7 +29,7 @@ from rest_framework import status
 # Baserow REST API base URL (inside the container: localhost:8682 is
 # the external Traefik port — the container's own Caddy serves :80,
 # but the task spec says :8682, so we respect it).
-BASEROW_API = "http://localhost/api"  # container-internal Caddy serves :80
+BASEROW_API = "http://localhost:8000/api"  # backend directly (bypasses Caddy Host-based routing)
 
 # Fallback path for the env file when env vars are not set inside the
 # container (common when .env is not mounted into the container).
