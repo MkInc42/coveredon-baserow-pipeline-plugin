@@ -34,6 +34,9 @@ All endpoints require JWT authentication (DRF `IsAuthenticated`).
 | GET | `/api/coveredon_pipeline/ping/` | Health check |
 | GET | `/api/coveredon_pipeline/triage/` | Pipeline triage buckets |
 | GET | `/api/coveredon_pipeline/stats/` | Aggregate statistics |
+| GET | `/api/coveredon_pipeline/chart/funnel/` | Ordered stage funnel (chart data) |
+| GET | `/api/coveredon_pipeline/chart/timeline/` | Leads created per day (chart data) |
+| GET | `/api/coveredon_pipeline/chart/channels/` | Contact channel distribution (chart data) |
 | POST | `/api/coveredon_pipeline/upload_image/` | Upload image + optionally attach to lead Screenshots |
 | POST | `/api/coveredon_pipeline/upload_images/` | Batch upload multiple images to a lead row |
 
