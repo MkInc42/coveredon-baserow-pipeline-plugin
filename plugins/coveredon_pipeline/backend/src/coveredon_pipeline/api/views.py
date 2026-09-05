@@ -228,6 +228,12 @@ def _is_truthy(val):
 
 # Baserow user-files upload endpoint path (multipart form, field name 'file')
 USER_FILES_UPLOAD_PATH = "/api/user-files/upload-file/"
+# Uploads are NOT reliably served on the backend-direct host (localhost:8000 can
+# 404 user-file routes depending on Host routing). Go through the in-container
+# Caddy (:80) and set the Host header to the public backend hostname so Caddy's
+# host matcher and Django ALLOWED_HOSTS both accept the request.
+PUBLIC_BACKEND_HOST = os.environ.get("PUBLIC_BACKEND_HOST", "baserow.dmz.local")
+UPLOAD_BASE = f"http://localhost{USER_FILES_UPLOAD_PATH}"
 
 # Allowed image MIME types for the upload endpoint. Block unsupported
 # formats (gif, svg, bmp, tiff) at the API level before touching Baserow.
@@ -823,11 +829,12 @@ class UploadImageView(APIView):
 
         try:
             upload_req = Request(
-                f"{BASEROW_API}{USER_FILES_UPLOAD_PATH}",
+                UPLOAD_BASE,
                 data=body_bytes,
                 headers={
                     "Authorization": f"JWT {token}",
                     "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Host": PUBLIC_BACKEND_HOST,
                 },
             )
             upload_resp = urlopen(upload_req, timeout=30)
@@ -1013,11 +1020,12 @@ class UploadImagesView(APIView):
 
             try:
                 upload_req = Request(
-                    f"{BASEROW_API}{USER_FILES_UPLOAD_PATH}",
+                    UPLOAD_BASE,
                     data=body_bytes,
                     headers={
                         "Authorization": f"JWT {token}",
                         "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Host": PUBLIC_BACKEND_HOST,
                     },
                 )
                 upload_resp = urlopen(upload_req, timeout=30)
