@@ -145,3 +145,38 @@ Gotchas log (learned live):
   reads — no admin credentials needed inside the container. JWT is obtained via
   /api/user/token-auth/ with {"username", "email", "password"} (send both keys).
 - Container-internal API base is http://localhost/api (Caddy :80), NOT :8682.
+
+## Deploy gotchas learned live 2026-09-05 (upload endpoints rollout)
+
+- **uv venv ships WITHOUT pip.** `/baserow/venv/bin/pip` does not exist on a
+  fresh 2.3.3 image; `/baserow/venv/bin/python -m pip` fails with
+  "No module named pip". Bootstrap FIRST:
+  `docker exec -u root baserow /baserow/venv/bin/python -m ensurepip`
+- **Files on the volume ≠ wheel in the venv.** install-plugin only lays files.
+  If Django's plugin scan finds the dir but the module isn't importable, the
+  backend + both celery workers crash-loop with
+  `ModuleNotFoundError: No module named 'coveredon_pipeline'` (container stays
+  up, frontend serves `connect ECONNREFUSED 127.0.0.1:8000` on every page).
+- **Backend-direct vs Caddy routing for uploads.** `localhost:8000/api` (backend
+  direct) 404s `POST /api/user-files/upload-file/` — user-file upload is only
+  served correctly through in-container Caddy (:80) with the public backend
+  Host header. The upload views therefore POST to
+  `http://localhost/api/user-files/upload-file/` with
+  `Host: $PUBLIC_BACKEND_HOST` (env, default `baserow.dmz.local`). Row/token
+  endpoints (`/api/database/...`, `/api/user/token-auth/`) work fine direct on
+  `localhost:8000`.
+- **Idempotent attach contract (verified live):** upload + attach reads the row
+  first, dedupes by hashed file `name`, preserves existing Screenshots entries.
+  Re-POSTing the same bytes returns `attached: false` — safe to retry.
+- **PATCH format for the file field:** `user_field_names=true` +
+  `{"Screenshots": [{"name": "<hashed name from upload response>"}]}`. The
+  field REPLACES, never appends — always merge with the row's existing list.
+- **Diagnosis speed-run for future crashes:** frontend up + 500 pages saying
+  `connect ECONNREFUSED 127.0.0.1:8000` = backend process dead, check compose
+  logs for the Python traceback; `ModuleNotFoundError` on the plugin = files
+  present but wheel missing from venv (ensurepip + pip install fixes).
+- **Dozzle MCP** (`DOZZLE_ENABLE_MCP=true`, endpoint `/api/mcp`) gives
+  list_containers/get_container_logs/search_container_logs to agents — but it
+  only sees containers on the Docker host it is pointed at. The baserow
+  container lives on ext-host-co's own Docker; a Dozzle watching docker-proxy
+  will NOT show it.
