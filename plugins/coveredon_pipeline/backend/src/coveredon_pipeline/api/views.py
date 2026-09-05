@@ -97,6 +97,11 @@ def _get_jwt(request=None):
     fails (which results in a 500 response to the caller — the endpoint
     cannot function without a valid token).
     """
+    # Prefer forwarding the caller's own JWT (no admin creds needed in-container).
+    if request is not None:
+        auth = request.headers.get("Authorization", "")
+        if auth:
+            return auth.split(" ", 1)[1] if " " in auth else auth
     email, password = _get_admin_credentials()
     if not email or not password:
         raise RuntimeError(
