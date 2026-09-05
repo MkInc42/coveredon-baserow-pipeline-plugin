@@ -29,7 +29,7 @@ from rest_framework import status
 # Baserow REST API base URL (inside the container: localhost:8682 is
 # the external Traefik port — the container's own Caddy serves :80,
 # but the task spec says :8682, so we respect it).
-BASEROW_API = "http://localhost:8682/api"
+BASEROW_API = "http://localhost/api"  # container-internal Caddy serves :80
 
 # Fallback path for the env file when env vars are not set inside the
 # container (common when .env is not mounted into the container).
@@ -104,7 +104,7 @@ def _get_jwt():
             "in environment or /home/black/baserow-dmz/.env"
         )
 
-    payload = json.dumps({"email": email, "password": password}).encode()
+    payload = json.dumps({"username": email, "email": email, "password": password}).encode()
     req = Request(
         f"{BASEROW_API}/user/token-auth/",
         data=payload,
