@@ -83,3 +83,31 @@ python3 verify.py --live   # also hits live Baserow API
 ```
 
 Requires Baserow 2.3.3 running with Leads table (885) and Orgs table (884).
+## Updating an already-installed plugin (CRITICAL gotchas)
+
+`install-plugin` WITHOUT `--overwrite` will NOT refresh files ("Found an existing
+plugin installed... not overwriting") — the wheel then rebuilds from STALE code.
+Also, `pip install <repo-tarball-url>` fails ("neither setup.py nor pyproject.toml
+found") because setup.py is nested under plugins/<module>/backend in the archive.
+
+Correct update procedure:
+
+```bash
+# 1. refresh files with --overwrite
+docker exec baserow ./baserow.sh install-plugin   --overwrite   --url https://api.github.com/repos/MkInc42/coveredon-baserow-pipeline-plugin/tarball/master
+
+# 2. rebuild + reinstall the wheel from the refreshed local path
+docker exec baserow /baserow/venv/bin/python -m pip install --force-reinstall --no-deps   /baserow/data/plugins/coveredon_pipeline/backend
+
+# 3. restart
+docker restart baserow
+```
+
+Gotchas log (learned live):
+- tarball/master URLs: pip needs setup.py at the archive root — it is not; use the
+  local-path install (step 2) instead.
+- install-plugin skips existing dirs without --overwrite (silently keeps OLD code).
+- Plugin auth design: endpoints forward the CALLER's JWT to Baserow REST for row
+  reads — no admin credentials needed inside the container. JWT is obtained via
+  /api/user/token-auth/ with {"username", "email", "password"} (send both keys).
+- Container-internal API base is http://localhost/api (Caddy :80), NOT :8682.
