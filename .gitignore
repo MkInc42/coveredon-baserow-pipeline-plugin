@@ -1,0 +1,4 @@
+# Python cache files — must never be tracked in git
+__pycache__/
+*.pyc
+*.pyo

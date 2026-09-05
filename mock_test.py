@@ -250,6 +250,96 @@ def test_endpoints(mock_server):
     assert stats["score"].get("WARM", 0) == 4
     print("  STATS VALUES  All assertions passed")
 
+    # ── Test funnel logic ──────────────────────────────────────────
+    # Pipeline order: NEW, COREY_DRAFT_QUEUED, DRAFT_READY,
+    # SEND_APPROVED, REPLIED, then other stages alphabetically last.
+    PIPELINE_ORDER = ["NEW", "COREY_DRAFT_QUEUED", "DRAFT_READY",
+                      "SEND_APPROVED", "REPLIED"]
+    from collections import Counter
+    funnel_stage_counts = Counter()
+    for lead in leads:
+        stage = lead.get("stage") or "(unset)"
+        funnel_stage_counts[stage] += 1
+
+    known = {s: funnel_stage_counts.get(s, 0) for s in PIPELINE_ORDER}
+    others = {s: c for s, c in funnel_stage_counts.items()
+              if s not in PIPELINE_ORDER}
+
+    funnel = []
+    for stage in PIPELINE_ORDER:
+        cnt = known[stage]
+        if cnt > 0:
+            funnel.append({"stage": stage, "count": cnt})
+    for stage in sorted(others.keys()):
+        funnel.append({"stage": stage, "count": others[stage]})
+
+    # Verify funnel order + counts
+    funnel_stages = [f["stage"] for f in funnel]
+    assert funnel_stages == ["NEW", "DRAFT_READY", "SEND_APPROVED",
+                             "REPLIED", "(unset)"], f"funnel order: {funnel_stages}"
+    assert sum(f["count"] for f in funnel) == len(leads), \
+        f"funnel count mismatch: {sum(f['count'] for f in funnel)} vs {len(leads)}"
+    print("  FUNNEL OK     Pipeline-order funnel verified")
+
+    # ── Test timeline logic ────────────────────────────────────────
+    # Simulate the same logic TimelineView uses: count created_at per
+    # day for last 14 days, split total vs hot.
+    today = datetime.now(timezone.utc)
+    from datetime import timedelta
+
+    # Determine the range
+    days_param = 14
+    range_start = today - timedelta(days=days_param - 1)
+    timeline = {}
+    for i in range(days_param):
+        d = (range_start + timedelta(days=i)).strftime("%Y-%m-%d")
+        timeline[d] = {"date": d, "count": 0, "hot_count": 0}
+
+    for lead in leads:
+        created_str = lead.get("created_at")
+        if not created_str:
+            continue
+        try:
+            created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        date_key = created.strftime("%Y-%m-%d")
+        if date_key in timeline:
+            timeline[date_key]["count"] += 1
+            if lead.get("score") == "HOT":
+                timeline[date_key]["hot_count"] += 1
+
+    timeline_result = [timeline[d] for d in sorted(timeline.keys())]
+
+    # Verify: all 14 days present
+    assert len(timeline_result) == 14, f"timeline days: {len(timeline_result)}"
+    # Total counts across all days should match total leads with created_at
+    total_in_timeline = sum(e["count"] for e in timeline_result)
+    assert total_in_timeline <= len(leads), f"timeline total exceeds leads"
+    print(f"  TIMELINE OK   {len(timeline_result)} days, {total_in_timeline} lead-dates counted")
+
+    # ── Test channels logic ────────────────────────────────────────
+    channel_counts = Counter()
+    usable_contact_counts = Counter()
+    for lead in leads:
+        channel = lead.get("contact_channel_recommendation") or "(unset)"
+        channel_counts[channel] += 1
+        if bool(lead.get("has_usable_contact")):
+            usable_contact_counts[channel] += 1
+
+    channels = sorted(channel_counts.keys(),
+                      key=lambda c: channel_counts[c], reverse=True)
+
+    # Verify total channel distribution matches
+    total_channels = sum(channel_counts.values())
+    assert total_channels == len(leads), \
+        f"channels total mismatch: {total_channels} vs {len(leads)}"
+
+    print(f"  CHANNELS OK   {len(channels)} channels, {total_channels} total")
+    for ch in channels:
+        uc = usable_contact_counts.get(ch, 0)
+        print(f"    {ch}: {channel_counts[ch]} leads, {uc} usable_contact")
+
     return errors
 
 

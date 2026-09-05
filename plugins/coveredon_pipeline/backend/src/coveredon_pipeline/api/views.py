@@ -1,4 +1,4 @@
-"""Pipeline triage, stats, and health views for Covered On Baserow plugin.
+"""Pipeline triage, stats, chart, and health views for Covered On Baserow plugin.
 
 All views authenticate via JWT token obtained from the Baserow REST API
 using the admin credentials defined in BASEROW_ADMIN_EMAIL / BASEROW_ADMIN_PASSWORD
@@ -9,9 +9,12 @@ http://localhost:8682/api/ — NOT via Django ORM directly, because the task
 spec requires going through the API path.
 
 Endpoints:
-  GET  pipeline/ping/   — health check
-  GET  pipeline/triage/ — pipeline triage buckets
-  GET  pipeline/stats/  — aggregate counts
+  GET  pipeline/ping/        — health check
+  GET  pipeline/triage/      — pipeline triage buckets
+  GET  pipeline/stats/       — aggregate counts
+  GET  chart/funnel/         — ordered stage funnel (chart data)
+  GET  chart/timeline/?days= — leads created per day (chart data)
+  GET  chart/channels/       — contact channel distribution (chart data)
 """
 from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
@@ -397,3 +400,168 @@ class StatsView(APIView):
                 },
             }
         )
+
+
+# ── Chart Views ───────────────────────────────────────────────────
+
+
+class FunnelView(APIView):
+    """Pipeline stage funnel endpoint.
+
+    Returns an ordered list of [{stage, count}] sorted by pipeline order:
+    NEW, COREY_DRAFT_QUEUED, DRAFT_READY, SEND_APPROVED, REPLIED, then
+    any other stages alphabetically last. Unset/null stages appear as
+    '(unset)' — matching the pattern StatsView uses.
+    """
+    permission_classes = (IsAuthenticated,)
+
+    # Canonical pipeline order — stages not in this list sort last
+    PIPELINE_ORDER = [
+        "NEW",
+        "COREY_DRAFT_QUEUED",
+        "DRAFT_READY",
+        "SEND_APPROVED",
+        "REPLIED",
+    ]
+
+    def get(self, request):
+        try:
+            token = _get_jwt(request)
+            leads = _fetch_leads(token)
+        except RuntimeError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        from collections import Counter
+
+        stage_counts = Counter()
+        for lead in leads:
+            stage = lead.get("stage") or "(unset)"
+            stage_counts[stage] += 1
+
+        # Build sorted list: known stages in pipeline order, then others alphabetically
+        known = {s: stage_counts.get(s, 0) for s in self.PIPELINE_ORDER}
+        others = {s: c for s, c in stage_counts.items() if s not in self.PIPELINE_ORDER}
+
+        funnel = []
+        for stage in self.PIPELINE_ORDER:
+            cnt = known[stage]
+            if cnt > 0:
+                funnel.append({"stage": stage, "count": cnt})
+
+        # Append remaining stages in alphabetical order
+        for stage in sorted(others.keys()):
+            funnel.append({"stage": stage, "count": others[stage]})
+
+        return Response({"funnel": funnel})
+
+
+class TimelineView(APIView):
+    """Lead creation timeline endpoint.
+
+    Returns lead counts per day for the last N days (default 14).
+    Each entry: {date: YYYY-MM-DD, count, hot_count}. Days with zero
+    leads are included so the chart always spans the full window.
+
+    Query params:
+      days (int, optional) — number of days to look back (default 14).
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        # Parse days param — default 14, clamp to positive int
+        try:
+            days = int(request.query_params.get("days", 14))
+        except (ValueError, TypeError):
+            days = 14
+        if days < 1:
+            days = 14
+
+        try:
+            token = _get_jwt(request)
+            leads = _fetch_leads(token)
+        except RuntimeError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        now = datetime.now(timezone.utc)
+        range_start = now - timedelta(days=days - 1)
+
+        # Build a dict of {YYYY-MM-DD: {date, count, hot_count}} for every day in range.
+        # Initialise all days with zero so the chart always spans the full window.
+        timeline = {}
+        for i in range(days):
+            d = (range_start + timedelta(days=i)).strftime("%Y-%m-%d")
+            timeline[d] = {"date": d, "count": 0, "hot_count": 0}
+
+        for lead in leads:
+            created_str = lead.get("created_at")
+            if not created_str:
+                continue  # skip leads with no created_at
+            try:
+                created = datetime.fromisoformat(
+                    created_str.replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                continue
+
+            date_key = created.strftime("%Y-%m-%d")
+            if date_key in timeline:
+                timeline[date_key]["count"] += 1
+                if lead.get("score") == "HOT":
+                    timeline[date_key]["hot_count"] += 1
+
+        # Return sorted by date ascending
+        result = [timeline[d] for d in sorted(timeline.keys())]
+        return Response({"timeline": result})
+
+
+class ChannelsView(APIView):
+    """Contact channel distribution endpoint.
+
+    Returns a list of [{channel, count, usable_contact_count}] showing
+    how leads are distributed across contact channels. Unset/null channels
+    appear as '(unset)' — matching the pattern StatsView uses.
+    """
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        try:
+            token = _get_jwt(request)
+            leads = _fetch_leads(token)
+        except RuntimeError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        from collections import Counter
+
+        channel_counts = Counter()
+        usable_contact_counts = Counter()
+
+        for lead in leads:
+            channel = lead.get("contact_channel_recommendation") or "(unset)"
+            channel_counts[channel] += 1
+            if _is_truthy(lead.get("has_usable_contact")):
+                usable_contact_counts[channel] += 1
+
+        # Build result sorted by count descending (most used channels first)
+        result = [
+            {
+                "channel": channel,
+                "count": channel_counts[channel],
+                "usable_contact_count": usable_contact_counts[channel],
+            }
+            for channel in sorted(
+                channel_counts.keys(),
+                key=lambda c: channel_counts[c],
+                reverse=True,
+            )
+        ]
+
+        return Response({"channels": result})
